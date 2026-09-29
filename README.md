@@ -8,7 +8,7 @@ Every skill runs as a slash command. Claude can also call `status` and `result` 
 
 | Skill | Who invokes it | What it does |
 | --- | --- | --- |
-| `/agy:rescue [flags] <task>` | You | Hands a bug, investigation or implementation to agy. Edits your repo unless `--read-only`. |
+| `/agy:rescue [flags] <task>` | You | Hands a bug, investigation or implementation to agy. For code changes in a repo under `$HOME`, use `--as-diff` (see below). |
 | `/agy:review [--base <ref>] [focus]` | You | Read-only review of uncommitted changes, or of the branch against `<ref>`. |
 | `/agy:adversarial-review [--base <ref>] [focus]` | You | Read-only critique of design, assumptions and tradeoffs. |
 | `/agy:status [job]` | You or Claude | Lists jobs for this repo. |
@@ -18,7 +18,7 @@ Every skill runs as a slash command. Claude can also call `status` and `result` 
 
 For delegation that Claude starts itself, the `agy-rescue` subagent hands a task to agy when you have told Claude to send that kind of work there.
 
-Shared flags: `--background` (return a job id immediately), `--model <id>` (see `agy models`), `--effort low|medium|high|max`, `--wait <seconds>` (foreground limit, default 540), `--add-dir <dir>` (repeatable: another directory agy may read, such as a sibling repo). Rescue-only flags: `--read-only`, `--resume` (continue the last agy task conversation in this repo), `--allow-shell`.
+Shared flags: `--background` (return a job id immediately), `--model <id>` (see `agy models`), `--effort low|medium|high|max`, `--wait <seconds>` (foreground limit, default 540), `--add-dir <dir>` (repeatable: another directory agy may read, such as a sibling repo). Rescue-only flags: `--as-diff` (agy returns the change as a patch that the plugin applies; the way to get edits in a repo under `$HOME`), `--read-only`, `--resume` (continue the last agy task conversation in this repo), `--allow-shell`.
 
 Set `AGY_COMPANION_MODEL` to change the default model.
 
@@ -53,7 +53,7 @@ These are properties of `agy -p` 1.2.x that the plugin was built around. All of 
   { "permissions": { "allow": ["command(uv run pytest)", "command(git diff)"] } }
   ```
   `--allow-shell` only changes the instructions agy receives. It never passes `--dangerously-skip-permissions`.
-- **File writes are not blocked in headless mode, not even with `--mode plan`.** Reviews and `--read-only` tasks therefore run in a detached git worktree under `~/.cache/agy-companion/worktrees`, with your uncommitted changes and untracked files copied in. The worktree is deleted when the job ends. Because the real repo is outside that snapshot, agy may not read it (under `$HOME` the read is denied and the job fails), so any mention of the repo's path in your request is rewritten to the snapshot's path, and agy is told where the snapshot is.
+- **Where agy may write depends on the location, not on the workspace.** Under `$HOME`, headless agy denies every file write, edits and new files alike, even inside its own workspace, and the denial ends its turn. In a `/tmp` workspace the same edit succeeds, and `--mode plan` does not stop it. Both were observed on agy 1.2.12 with default settings; other locations were not tested. So agy cannot be trusted to stay read-only by itself, and it cannot edit your real repos either. Reviews, `--read-only` and `--as-diff` tasks therefore run in a detached git worktree under `~/.cache/agy-companion/worktrees`, with your uncommitted changes and untracked files copied in. The worktree is deleted when the job ends. Because the real repo is outside that snapshot, agy may not read it (under `$HOME` the read is denied and the job fails), so any mention of the repo's path in your request is rewritten to the snapshot's path, and agy is told where the snapshot is.
 - **Reading outside the repo is denied, and so is reading through a symlink that points outside it.** Pass `--add-dir <dir>` for each extra directory agy needs. A skill or file symlinked from elsewhere (for example into `~/.gemini/config/skills/`) is listed by agy but denied when read, so use a real copy there.
 - **Writing into an `--add-dir` directory was denied too** (observed on agy 1.2.12 with default permissions). The prompt also tells agy those directories are read-only. This is agy's behavior, not a sandbox the plugin enforces: if you allow-list `write_file` in agy's settings, agy could write there, even in a `--read-only` job.
 - **The plugin never bypasses agy's permissions.** agy's own denial message suggests re-running with `--dangerously-skip-permissions`; the plugin strips that advice, and its skills and subagent are told never to use it and to report denials instead.
@@ -61,6 +61,15 @@ These are properties of `agy -p` 1.2.x that the plugin was built around. All of 
 - **Large context goes through a file.** A single argv entry is capped at 128 KiB on Linux and `agy -p` does not read the prompt from stdin, so the review diff is written to `.agy-context/CONTEXT.md` inside the worktree and agy reads it from there.
 
 Job records and logs live in `$CLAUDE_PLUGIN_DATA` (falls back to `~/.claude/agy-companion`).
+
+## Getting edits from agy: `--as-diff`
+
+`/agy:rescue --as-diff <task>` runs agy on a read-only snapshot and asks for the whole change as one unified diff. The plugin then:
+
+1. Extracts the ```` ```diff ```` block from agy's answer and saves it under `$CLAUDE_PLUGIN_DATA/patches/<job>.diff`.
+2. Splits it per file and applies each file with `git apply --recount`, which fixes the wrong `@@` line counts agy often writes.
+3. If a file does not apply, it retries once with blank context lines trimmed from the edges of each hunk (agy tends to pad hunks with a blank line past the end of the file).
+4. Reports which files were applied and which were not. A file whose hunks still do not match, for example because agy repeated or paraphrased context lines, is left untouched.
 
 ## Evidence checks
 
@@ -77,7 +86,8 @@ The check proves a name exists; it does not prove the name sits under the right 
 ## Risks and limits
 
 - **It depends on undocumented agy behavior.** Everything under "How it behaves" was observed on agy 1.2.12, not taken from a spec. If a later agy changes the JSON output or the headless permission rules, the first symptom is jobs ending as `failed`. Run `/agy:setup` to check.
-- **`/agy:rescue` edits your working tree directly and without approval.** Headless agy does not ask before writing files. Commit or stash first if you want an easy way back, or use `--read-only`.
+- **Without `--as-diff`, `/agy:rescue` usually cannot edit your code.** In a repo under `$HOME` (the normal case) every write is denied, and the job fails with a warning that says so. If you add a `write_file` allow-rule to agy's `settings.json` yourself, agy will edit your working tree directly and without asking; commit or stash first. The plugin never edits agy's settings.
+- **`--as-diff` applies agy's patch to your working tree.** It only applies a file if its hunks match. agy's hunks are often imperfect, so the plugin recounts hunk headers (`git apply --recount`) and, if a file still fails, retries once after trimming blank context lines at the edges of each hunk. Anything else that does not match is reported and left untouched, and the whole patch is saved for you to inspect.
 - **By default agy cannot run tests.** It lists the commands for you to run instead. See `--allow-shell` above.
 - **Each call has a fixed start-up cost.** Around 20 s of wall time before the model starts, measured on one WSL2 machine.
 - **It spends your Antigravity quota, not zero tokens.** Each job used roughly 50k–70k agy tokens on small test repositories. Real repositories will likely use more; that was not measured.

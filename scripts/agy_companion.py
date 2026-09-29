@@ -23,6 +23,10 @@ Facts about `agy -p` (v1.2.x) this script is built around:
   * Reading outside the workspace is denied in headless mode ("read_file"),
     including through a symlink whose target is outside. `--add-dir` makes a
     directory readable; writing into it is still denied ("write_file").
+  * Writes are denied even INSIDE the workspace when it lives under $HOME
+    (edits and new files alike; observed on agy 1.2.x with default settings),
+    while the same edit in a /tmp workspace succeeds. Real repos are under
+    $HOME, so `--as-diff` asks agy for a unified diff and applies it here.
 """
 
 from __future__ import annotations
@@ -73,6 +77,13 @@ Operating rules for this session:
 - You are working directly in the user's repository. Edit files as needed to complete the task.
 - Only the shell commands the user allow-listed will run; any other command is denied and a denial aborts your whole turn. Prefer your file tools (view_file, grep_search, replace_file_content, write_to_file) and use run_command only for build/test commands you were told are allowed.
 - Finish with a short report: what you changed (path:line), what you verified and how, and what remains unverified."""
+
+DIFF_RULES = """\
+Output format (this overrides any instruction above about editing files): you cannot edit files in this session. Deliver the complete change as ONE unified diff in git format inside a single ```diff fenced block:
+- One `diff --git a/<path> b/<path>` section per file, paths relative to the repository root. New files use `--- /dev/null`.
+- Copy every context line and every removed line character-for-character from the current file, each exactly once and in file order. Never repeat, reorder or paraphrase context lines; re-read the file region before writing its hunk.
+- Hunk line counts may be approximate; they are recounted before applying.
+After the diff block, give the short report (changes as path:line, verification commands)."""
 
 EVIDENCE_RULES = """\
 Evidence rules (the user will machine-check your answer against the code):
@@ -437,6 +448,101 @@ def scrub_unsafe_advice(text: str) -> str:
     return UNSAFE_ADVICE_RE.sub("", text)
 
 
+DIFF_BLOCK_RE = re.compile(r"```diff[^\n]*\n(.*?)```", re.S)
+
+
+def split_file_patches(diff: str) -> list[tuple[str, str]]:
+    """Split a multi-file unified diff into (path, patch) pairs."""
+    chunks = re.split(r"(?m)^(?=diff --git )", diff)
+    if len(chunks) == 1:  # no `diff --git` headers: split on `--- ` file headers
+        chunks = re.split(r"(?m)^(?=--- (?:a/|/dev/null))", diff)
+    out = []
+    for chunk in chunks:
+        if "@@" not in chunk:
+            continue
+        m = re.search(r"(?m)^\+\+\+ (?:b/)?(\S+)", chunk) or re.search(r"(?m)^diff --git a/\S+ b/(\S+)", chunk)
+        path = m.group(1) if m else "?"
+        if path == "/dev/null":  # deletion: take the source path
+            m2 = re.search(r"(?m)^--- (?:a/)?(\S+)", chunk)
+            path = m2.group(1) if m2 else path
+        out.append((path, chunk if chunk.endswith("\n") else chunk + "\n"))
+    return out
+
+
+def trim_blank_context(patch: str) -> str:
+    """Drop blank context lines at the start and end of every hunk.
+
+    agy often pads a hunk with a blank context line the file does not have
+    (typically past the end of the file). Removing edge context only reduces
+    how much surrounding text must match; added and removed lines are kept.
+    """
+    out, hunk = [], []
+
+    def flush():
+        while hunk and hunk[0].strip() == "":
+            hunk.pop(0)
+        while hunk and hunk[-1].strip() == "":
+            hunk.pop()
+        out.extend(hunk)
+        hunk.clear()
+
+    in_hunk = False
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            flush()
+            out.append(line)
+            in_hunk = True
+        elif line.startswith("diff --git ") or (not in_hunk and line[:4] in ("--- ", "+++ ")):
+            flush()
+            out.append(line)
+            in_hunk = False
+        elif in_hunk:
+            hunk.append(line)
+        else:
+            out.append(line)
+    flush()
+    return "\n".join(out) + "\n"
+
+
+def git_apply(root: str, patch: str, check: bool) -> subprocess.CompletedProcess:
+    cmd = ["git", "apply", "--recount"] + (["--check"] if check else []) + ["-"]
+    return subprocess.run(cmd, cwd=root, input=patch.encode(), capture_output=True)
+
+
+def apply_agy_diff(root: str, response: str, save_to: Path) -> dict:
+    """Extract agy's ```diff block and apply it to the user's repo, file by file.
+
+    agy's hunk headers often carry wrong line counts, so every file is applied
+    with `git apply --recount`. Each file is checked first and applied only if
+    it applies cleanly; the rest are reported, never forced.
+    """
+    blocks = DIFF_BLOCK_RE.findall(response)
+    if not blocks:
+        return {"saved": None, "files": [], "error": "agy's answer contains no ```diff block"}
+    diff = max(blocks, key=len)
+    save_to.parent.mkdir(parents=True, exist_ok=True)
+    save_to.write_text(diff)
+    files = []
+    for path, patch in split_file_patches(diff):
+        note = ""
+        check = git_apply(root, patch, check=True)
+        if check.returncode != 0:
+            trimmed = trim_blank_context(patch)
+            if trimmed != patch and git_apply(root, trimmed, check=True).returncode == 0:
+                patch, note = trimmed, "after trimming blank edge context"
+            else:
+                files.append({"file": path, "status": "failed", "error": check.stderr.decode(errors="replace").strip()[-300:]})
+                continue
+        done = git_apply(root, patch, check=False)
+        if done.returncode == 0:
+            files.append({"file": path, "status": "applied", "note": note})
+        else:
+            files.append({"file": path, "status": "failed", "error": done.stderr.decode(errors="replace").strip()[-300:]})
+    if not files:
+        return {"saved": str(save_to), "files": [], "error": "the ```diff block contains no file hunks"}
+    return {"saved": str(save_to), "files": files}
+
+
 def point_at_snapshot(text: str, root: str, wt: Path) -> str:
     """Rewrite mentions of the real repo path to the read-only snapshot path.
 
@@ -516,7 +622,8 @@ def run_job(job_id: str) -> None:
                 rules = WRITE_RULES_WITH_SHELL if job.get("allow_shell") else WRITE_RULES
             user_prompt = point_at_snapshot(job["prompt"], root, wt) if wt else job["prompt"]
             sandbox = snapshot_note(root, wt) if wt else ""
-            prompt = f"{user_prompt}\n\n{rules}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}{sandbox}"
+            diff_rules = f"\n\n{DIFF_RULES}" if job.get("as_diff") else ""
+            prompt = f"{user_prompt}\n\n{rules}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}{sandbox}{diff_rules}"
 
         stdout_f = DATA_DIR / "logs" / f"{job_id}.stdout"
         stderr_f = DATA_DIR / "logs" / f"{job_id}.stderr"
@@ -551,6 +658,8 @@ def run_job(job_id: str) -> None:
         elif not ok:
             job["error"] = (result.get("error") or stderr.strip() or f"agy exited {proc.returncode}")[-4000:]
         job["status"] = "completed" if ok else "failed"
+        if ok and job.get("as_diff"):
+            job["patch"] = apply_agy_diff(root, job["response"], DATA_DIR / "patches" / f"{job_id}.diff")
     except Exception as exc:  # noqa: BLE001 - runner must always record an outcome
         job.update(status="failed", error=f"{type(exc).__name__}: {exc}")
     finally:
@@ -613,7 +722,21 @@ def render_result(job: dict) -> str:
                 "the workspace is denied too: use a real copy or add the target's directory)"
             )
         if "write_file" in actions:
-            hints.append("agy tried to write outside the workspace (e.g. into an --add-dir), which headless mode denies")
+            denied_writes = [e for e in job.get("files_read") or [] if e.startswith("DENIED/FAILED") and "write_file" in e]
+            # trace paths inside the repo are shown relative; anything absolute is outside it
+            outside = [e for e in denied_writes if len(e.split()) > 2 and e.split()[2].startswith("/")]
+            if denied_writes and not outside:
+                hints.append(
+                    "agy was denied an edit INSIDE the repo. Headless agy denies file writes under $HOME even in its "
+                    "own workspace (a /tmp workspace is writable, which is why /tmp tests pass). Re-run with --as-diff "
+                    "to get the change as a patch applied here, or add a write_file allow-rule in agy's settings.json "
+                    "yourself (the plugin never edits agy's settings)"
+                )
+            else:
+                hints.append(
+                    "agy was denied a file write (outside the repo, e.g. into an --add-dir, or under $HOME where "
+                    "headless agy denies writes); re-run with --as-diff to get the change as a patch applied here"
+                )
         lines.append(
             f"WARNING: agy was denied these tools in headless mode: {names}. A denial ends agy's turn, so its answer "
             f"is likely incomplete. Do not retry with --dangerously-skip-permissions; report this to the user. "
@@ -649,6 +772,21 @@ def render_result(job: dict) -> str:
     if job.get("response"):
         lines.append("")
         lines.append(job["response"].rstrip())
+    patch = job.get("patch")
+    if patch is not None:
+        applied = [f["file"] + (f" ({f['note']})" if f.get("note") else "") for f in patch["files"] if f["status"] == "applied"]
+        failed = [f for f in patch["files"] if f["status"] != "applied"]
+        lines.append("")
+        if patch.get("error"):
+            lines.append(f"WARNING — PATCH: {patch['error']}. Nothing was applied.")
+        else:
+            lines.append(f"Patch: applied {len(applied)} of {len(patch['files'])} files" + (f": {', '.join(applied)}" if applied else "") + ".")
+            for f in failed:
+                lines.append(f"WARNING — PATCH NOT APPLIED to {f['file']}: {f.get('error', '')}")
+            if failed:
+                lines.append("The files above were left untouched; fix or apply their hunks by hand.")
+        if patch.get("saved"):
+            lines.append(f"Full patch saved at {patch['saved']}.")
     if job.get("files_read"):
         shown = job["files_read"][:25]
         lines.append("")
@@ -726,11 +864,14 @@ def cmd_task(args: argparse.Namespace) -> None:
         die("task needs a prompt describing what agy should do")
     cwd = os.getcwd()
     root = repo_root(cwd)
+    if args.as_diff:
+        args.read_only = True  # agy works on the snapshot; the patch is applied to the real repo
     if args.read_only and not root:
-        die("--read-only needs a git repository (it runs agy in a throwaway worktree)")
+        die("--read-only and --as-diff need a git repository (they run agy in a throwaway worktree)")
     workspace = root or cwd
     job = new_job("task", args, workspace, prompt, args.read_only)
     job["allow_shell"] = args.allow_shell
+    job["as_diff"] = args.as_diff
     if args.resume:
         prev = next(
             (j for j in jobs_for(workspace) if j["kind"] == "task" and j.get("conversation_id")),
@@ -852,6 +993,10 @@ def main() -> None:
     p.add_argument(
         "--allow-shell", action="store_true",
         help="tell agy it may use the shell commands you allow-listed in agy's settings.json (does NOT bypass agy permissions)",
+    )
+    p.add_argument(
+        "--as-diff", action="store_true",
+        help="agy returns the change as a unified diff (it cannot write under $HOME); the diff is applied here with git apply --recount",
     )
     p.add_argument("prompt", nargs=argparse.REMAINDER)
 
