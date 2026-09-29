@@ -1,7 +1,18 @@
 {
   "name": "agy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Delegate tasks, code reviews and adversarial reviews from Claude Code to the Antigravity CLI (agy), with background jobs.",
-  "author": { "name": "Json Gonzalez" },
-  "keywords": ["antigravity", "agy", "gemini", "delegation", "review"]
+  "author": {
+    "name": "Json Gonzalez"
+  },
+  "homepage": "https://github.com/json724/agy-plugin-cc#readme",
+  "repository": "https://github.com/json724/agy-plugin-cc",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "gemini",
+    "delegation",
+    "review"
+  ]
 }
