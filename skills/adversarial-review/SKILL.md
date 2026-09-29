@@ -14,4 +14,4 @@ User input: $ARGUMENTS
 Run with the Bash tool, timeout 600000 ms:
 `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py adversarial-review $ARGUMENTS`
 
-Present agy's critique verbatim, then add one line with your own take on whether its strongest point holds, citing path:line. Do not change code unless the user asks.
+Present agy's critique verbatim (with any WARNING — EVIDENCE CHECK line first), then add one line with your own take on whether its strongest point holds, citing path:line. Do not change code unless the user asks.

@@ -59,6 +59,18 @@ These are properties of `agy -p` 1.2.x that the plugin was built around. All of 
 
 Job records and logs live in `$CLAUDE_PLUGIN_DATA` (falls back to `~/.claude/agy-companion`).
 
+## Evidence checks
+
+agy sometimes fills gaps with names that sound right but are not in the code: dict keys, parameter names, schema constraints. The plugin defends against that in three layers:
+
+1. **Evidence rules in every prompt.** agy must cite `path:line` for each concrete claim, copy identifiers character-for-character from the code, separate schema constraints from runtime checks, and mark anything it did not read as "(inferred)".
+2. **An objective record of what agy read.** agy runs with `--output-format stream-json`, and the result lists every file it opened or searched, taken from its tool trace rather than from its own report.
+3. **A mechanical check on the answer.** Every backticked identifier containing `_` or `.` (quoted or not) is searched, as a whole word, in the files the answer cites:
+   - `WARNING — EVIDENCE CHECK`: the name is in no file agy cited or opened. Treat it as invented until you check it against the code.
+   - `Evidence note`: the name exists in a file agy opened but did not cite. The citation next to it probably points to the wrong file.
+
+The check proves a name exists; it does not prove the name sits under the right parent key, or that a claimed precondition is true. For contracts you will code against, re-read the cited lines.
+
 ## Risks and limits
 
 - **It depends on undocumented agy behavior.** Everything under "How it behaves" was observed on agy 1.2.12, not taken from a spec. If a later agy changes the JSON output or the headless permission rules, the first symptom is jobs ending as `failed`. Run `/agy:setup` to check.
@@ -66,7 +78,7 @@ Job records and logs live in `$CLAUDE_PLUGIN_DATA` (falls back to `~/.claude/agy
 - **By default agy cannot run tests.** It lists the commands for you to run instead. See `--allow-shell` above.
 - **Each call has a fixed start-up cost.** Around 20 s of wall time before the model starts, measured on one WSL2 machine.
 - **It spends your Antigravity quota, not zero tokens.** Each job used roughly 50k–70k agy tokens on small test repositories. Real repositories will likely use more; that was not measured.
-- **Output quality is agy's, not Claude's.** Claude relays the report; it does not re-verify it unless you ask.
+- **Output quality is agy's, not Claude's.** Claude relays the report; beyond the evidence check above, it does not re-verify it unless you ask.
 
 ## Not included (yet)
 

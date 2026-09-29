@@ -14,4 +14,4 @@ User input: $ARGUMENTS
 Run with the Bash tool, timeout 600000 ms:
 `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py review $ARGUMENTS`
 
-Without `--base` it reviews uncommitted changes; with `--base main` it reviews the whole branch. Present agy's findings verbatim. Do not fix anything unless the user asks.
+Without `--base` it reviews uncommitted changes; with `--base main` it reviews the whole branch. Present agy's findings verbatim. If the output has a WARNING — EVIDENCE CHECK line, show it first: the listed names are not in the files agy cited. Do not fix anything unless the user asks.

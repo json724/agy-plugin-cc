@@ -15,6 +15,11 @@ Facts about `agy -p` (v1.2.x) this script is built around:
   * The prompt cannot be piped through stdin in text mode, and a single argv
     entry is capped at 128 KiB on Linux, so large context goes into a file the
     agent reads with its native view_file tool.
+  * `--output-format stream-json` emits one event per tool step (tool name and
+    parameters), which gives an objective record of what agy actually read.
+  * agy sometimes fills gaps with plausible-looking identifiers (dict keys,
+    parameter names) that do not exist in the code. Every response is checked:
+    backticked identifiers must appear, as whole words, in the files it cites.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -64,6 +70,14 @@ Operating rules for this session:
 - You are working directly in the user's repository. Edit files as needed to complete the task.
 - Only the shell commands the user allow-listed will run; any other command is denied and a denial aborts your whole turn. Prefer your file tools (view_file, grep_search, replace_file_content, write_to_file) and use run_command only for build/test commands you were told are allowed.
 - Finish with a short report: what you changed (path:line), what you verified and how, and what remains unverified."""
+
+EVIDENCE_RULES = """\
+Evidence rules (the user will machine-check your answer against the code):
+- Every concrete claim about code (a name, dict key, parameter, type, default, enum, constraint, precondition, return shape) must come from lines you opened in this session. Cite them as path:line and copy identifiers character-for-character from the code, in backticks.
+- Docstrings, comments and naming conventions are not the code. If a docstring and the code disagree, report what the code does and point out the mismatch.
+- Separate constraints enforced by the signature or schema (type annotations, Field(...), enums) from checks done at runtime inside the function body. Say which one each constraint is.
+- If you did not read the lines that establish a claim, read them. If you still cannot confirm it, mark it "(inferred)". Never fill a gap with a name that merely sounds right.
+- A shorter answer with only verified items is better than a complete-looking answer with guesses."""
 
 REVIEW_PROMPT = """\
 You are a senior code reviewer. Review the change described in {context_file}.
@@ -265,21 +279,130 @@ def review_context(root: str, base: str | None) -> tuple[str, bool]:
 # agy invocation
 
 
-def parse_agy_output(stdout: str) -> dict | None:
-    start = stdout.find("{")
-    while start != -1:
+def iter_json_objects(stdout: str):
+    """Yield every top-level JSON object in agy output (json or stream-json)."""
+    decoder = json.JSONDecoder(strict=False)
+    pos = stdout.find("{")
+    while pos != -1:
         try:
-            obj, _ = json.JSONDecoder(strict=False).raw_decode(stdout[start:])
-            if isinstance(obj, dict) and "conversation_id" in obj:
-                return obj
+            obj, end = decoder.raw_decode(stdout, pos)
         except json.JSONDecodeError:
-            pass
-        start = stdout.find("{", start + 1)
+            pos = stdout.find("{", pos + 1)
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        pos = stdout.find("{", end)
+
+
+def parse_agy_output(stdout: str) -> dict | None:
+    for obj in iter_json_objects(stdout):
+        if obj.get("event") == "result" and isinstance(obj.get("result"), dict):
+            return obj["result"]
+        if "conversation_id" in obj and "status" in obj:
+            return obj
     return None
 
 
+def tool_trace(stdout: str) -> list[dict]:
+    """Completed tool steps from a stream-json run: name and parameters."""
+    steps = []
+    for obj in iter_json_objects(stdout):
+        step = obj.get("step_update") or {}
+        if step.get("step_type") == "tool" and step.get("state") == "DONE":
+            info = step.get("tool_info") or {}
+            steps.append({"tool": info.get("name") or step.get("tool_name"), "params": info.get("parameters") or {}})
+    return steps
+
+
+def rel_to(path: str, prefixes: list[str]) -> str:
+    for prefix in prefixes:
+        if prefix and path.startswith(prefix.rstrip("/") + "/"):
+            return path[len(prefix.rstrip("/")) + 1:]
+    return path
+
+
+def opened_files(steps: list[dict], prefixes: list[str]) -> list[str]:
+    """Repo-relative paths of files agy opened with a file-viewing tool."""
+    out = []
+    for step in steps:
+        if "view" not in (step["tool"] or ""):
+            continue
+        path = next((v for k, v in step["params"].items() if "path" in k.lower() and isinstance(v, str)), "")
+        if path and CONTEXT_DIRNAME not in path:
+            rel = rel_to(path, prefixes)
+            if rel not in out:
+                out.append(rel)
+    return out
+
+
+def files_read(steps: list[dict], prefixes: list[str]) -> list[str]:
+    """Human-readable list of what agy opened or searched, relative to the repo."""
+    def rel(path: str) -> str:
+        return rel_to(path, prefixes)
+
+    out: list[str] = []
+    for step in steps:
+        params = step["params"]
+        path = next((v for k, v in params.items() if "path" in k.lower() and isinstance(v, str)), "")
+        lines = [f"{v}" for k, v in params.items() if "line" in k.lower()]
+        query = next((v for k, v in params.items() if k.lower() in ("query", "pattern") and isinstance(v, str)), "")
+        label = step["tool"] or "?"
+        if CONTEXT_DIRNAME in path:
+            continue
+        entry = f"{label} {rel(path)}".strip()
+        if lines:
+            entry += f" (lines {'-'.join(lines)})"
+        if query:
+            entry += f" for {query!r}"
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
+CITATION_RE = re.compile(r"(?:file://)?([\w./-]+\.\w{1,5})(?:#L|:)\d+")
+# Accepts `name`, `"name"` and `'name'`: agy usually quotes dict keys.
+IDENT_RE = re.compile(r"`[\"']?([A-Za-z_][\w.]*)[\"']?`")
+
+
+def check_citations(root: str, text: str, opened: list[str] | None = None) -> dict:
+    """Check that backticked identifiers exist, as whole words, in the cited files.
+
+    Only identifiers containing "_" or "." are checked: those are the dict keys,
+    parameters and attribute paths agy tends to invent. Misses are split in two:
+    `uncited` names exist in a file agy opened but did not cite; `missing` names
+    are in no cited or opened file, which is the signature of an invented name.
+    """
+    root_path = Path(root)
+    cited = set()
+    for match in CITATION_RE.finditer(text):
+        path = match.group(1)
+        if path.startswith(root.rstrip("/") + "/"):
+            path = path[len(root.rstrip("/")) + 1:]
+        if (root_path / path).is_file():
+            cited.add(path)
+    if not cited:
+        return {"cited_files": [], "checked": 0, "missing": [], "uncited": []}
+
+    def read_all(paths) -> str:
+        return "\n".join((root_path / p).read_text(errors="replace") for p in sorted(paths) if (root_path / p).is_file())
+
+    def found(name: str, corpus: str) -> bool:
+        return re.search(rf"(?<!\w){re.escape(name.split('.')[-1])}(?!\w)", corpus) is not None
+
+    corpus = read_all(cited)
+    names = sorted({
+        t for t in IDENT_RE.findall(text)
+        if ("_" in t or "." in t) and not re.search(r"\.(py|md|json|ts|js|toml|ya?ml|txt|sh|html)$", t)
+    })
+    misses = [t for t in names if not found(t, corpus)]
+    opened_corpus = read_all(set(opened or []) - cited)
+    uncited = [t for t in misses if found(t, opened_corpus)]
+    missing = [t for t in misses if t not in uncited]
+    return {"cited_files": sorted(cited), "checked": len(names), "missing": missing, "uncited": uncited}
+
+
 def build_agy_cmd(job: dict, prompt: str) -> list[str]:
-    cmd = [require_agy(), "--output-format", "json"]
+    cmd = [require_agy(), "--output-format", "stream-json"]
     if job.get("model"):
         cmd += ["--model", job["model"]]
     if job.get("effort"):
@@ -311,13 +434,15 @@ def run_job(job_id: str) -> None:
             ctx_file = write_context(wt, ctx_text)
             template = REVIEW_PROMPT if job["kind"] == "review" else ADVERSARIAL_PROMPT
             focus = f"\nExtra focus requested by the user: {job['prompt']}\n" if job["prompt"] else ""
-            prompt = template.format(context_file=ctx_file, focus=focus, rules=READ_ONLY_RULES)
+            prompt = template.format(
+                context_file=ctx_file, focus=focus, rules=f"{READ_ONLY_RULES}\n\n{EVIDENCE_RULES}"
+            )
         else:
             if job["read_only"]:
                 rules = READ_ONLY_RULES
             else:
                 rules = WRITE_RULES_WITH_SHELL if job.get("allow_shell") else WRITE_RULES
-            prompt = f"{job['prompt']}\n\n{rules}"
+            prompt = f"{job['prompt']}\n\n{rules}\n\n{EVIDENCE_RULES}"
 
         stdout_f = DATA_DIR / "logs" / f"{job_id}.stdout"
         stderr_f = DATA_DIR / "logs" / f"{job_id}.stderr"
@@ -339,6 +464,10 @@ def run_job(job_id: str) -> None:
         job["usage"] = result.get("usage")
         job["agy_duration_seconds"] = result.get("duration_seconds")
         job["denied_actions"] = result.get("denied_actions") or []
+        steps, prefixes = tool_trace(stdout), [str(wt) if wt else "", root]
+        job["files_read"] = files_read(steps, prefixes)
+        if job["response"].strip():
+            job["citation_check"] = check_citations(root, job["response"], opened_files(steps, prefixes))
         ok = result.get("status") == "SUCCESS" and proc.returncode == 0
         if ok and not job["response"].strip():
             ok = False
@@ -395,9 +524,41 @@ def render_result(job: dict) -> str:
         )
     if job.get("error"):
         lines.append(f"ERROR: {job['error']}")
+    check = job.get("citation_check")
+    if check is not None:
+        if not check["cited_files"]:
+            lines.append("EVIDENCE CHECK: the answer cites no path:line in this repo, so none of its names could be verified.")
+        elif check["missing"] or check.get("uncited"):
+            if check["missing"]:
+                lines.append(
+                    f"WARNING — EVIDENCE CHECK: {len(check['missing'])} of {check['checked']} identifiers in the answer "
+                    f"appear in no file agy cited or opened: {', '.join(check['missing'])}. "
+                    "Treat them as possibly invented until checked against the code."
+                )
+            if check.get("uncited"):
+                lines.append(
+                    f"Evidence note: {', '.join(check['uncited'])} exist in files agy opened but did not cite; "
+                    "the citation next to them may point to the wrong file."
+                )
+            ok_count = check["checked"] - len(check["missing"]) - len(check.get("uncited", []))
+            lines.append(f"Evidence check: {ok_count} of {check['checked']} identifiers found in the cited files.")
+        elif check["checked"] == 0:
+            lines.append("Evidence check: the answer names no identifiers with '_' or '.' to verify.")
+        else:
+            lines.append(
+                f"Evidence check: all {check['checked']} identifiers found in the cited files "
+                f"({', '.join(check['cited_files'])})."
+            )
     if job.get("response"):
         lines.append("")
         lines.append(job["response"].rstrip())
+    if job.get("files_read"):
+        shown = job["files_read"][:25]
+        lines.append("")
+        lines.append(f"Files agy actually opened or searched (from its tool trace, {len(job['files_read'])} steps):")
+        lines += [f"- {entry}" for entry in shown]
+        if len(job["files_read"]) > len(shown):
+            lines.append(f"- … {len(job['files_read']) - len(shown)} more")
     return "\n".join(lines)
 
 
