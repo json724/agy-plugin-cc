@@ -1,0 +1,14 @@
+{
+  "name": "agy-plugin-cc",
+  "description": "Claude Code plugin that delegates tasks and code reviews to the Antigravity CLI (agy).",
+  "owner": {
+    "name": "Json Gonzalez"
+  },
+  "plugins": [
+    {
+      "name": "agy",
+      "source": "./",
+      "description": "Delegate work from Claude Code to the Antigravity CLI (agy)."
+    }
+  ]
+}
