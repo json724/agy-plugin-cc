@@ -20,6 +20,9 @@ Facts about `agy -p` (v1.2.x) this script is built around:
   * agy sometimes fills gaps with plausible-looking identifiers (dict keys,
     parameter names) that do not exist in the code. Every response is checked:
     backticked identifiers must appear, as whole words, in the files it cites.
+  * Reading outside the workspace is denied in headless mode ("read_file"),
+    including through a symlink whose target is outside. `--add-dir` makes a
+    directory readable; writing into it is still denied ("write_file").
 """
 
 from __future__ import annotations
@@ -364,7 +367,7 @@ CITATION_RE = re.compile(r"(?:file://)?([\w./-]+\.\w{1,5})(?:#L|:)\d+")
 IDENT_RE = re.compile(r"`[\"']?([A-Za-z_][\w.]*)[\"']?`")
 
 
-def check_citations(root: str, text: str, opened: list[str] | None = None) -> dict:
+def check_citations(root: str, text: str, opened: list[str] | None = None, extra_roots: list[str] | None = None) -> dict:
     """Check that backticked identifiers exist, as whole words, in the cited files.
 
     Only identifiers containing "_" or "." are checked: those are the dict keys,
@@ -378,7 +381,11 @@ def check_citations(root: str, text: str, opened: list[str] | None = None) -> di
         path = match.group(1)
         if path.startswith(root.rstrip("/") + "/"):
             path = path[len(root.rstrip("/")) + 1:]
-        if (root_path / path).is_file():
+        if path.startswith("/"):
+            # absolute citations count only inside an --add-dir
+            if any(path.startswith(d.rstrip("/") + "/") for d in extra_roots or []) and Path(path).is_file():
+                cited.add(path)
+        elif (root_path / path).is_file():
             cited.add(path)
     if not cited:
         return {"cited_files": [], "checked": 0, "missing": [], "uncited": []}
@@ -401,8 +408,35 @@ def check_citations(root: str, text: str, opened: list[str] | None = None) -> di
     return {"cited_files": sorted(cited), "checked": len(names), "missing": missing, "uncited": uncited}
 
 
+UNSAFE_ADVICE_RE = re.compile(r"\s*Alternatively, re-run with --dangerously-skip-permissions[^.]*\.", re.I)
+
+
+def scrub_unsafe_advice(text: str) -> str:
+    """Drop agy's own suggestion to bypass permissions from error text.
+
+    agy's denial message ends with "re-run with --dangerously-skip-permissions";
+    relayed verbatim, it invites the calling agent to do exactly that.
+    """
+    return UNSAFE_ADVICE_RE.sub("", text)
+
+
+def add_dirs_note(job: dict) -> str:
+    dirs = job.get("add_dirs") or []
+    if not dirs:
+        return ""
+    listed = "\n".join(f"- {d}" for d in dirs)
+    return (
+        "\n\nExtra directories you may READ (reference only):\n"
+        f"{listed}\n"
+        "Read them with view_file/grep_search using absolute paths and cite them as absolute path:line. "
+        "Never create, edit or delete files there: writes outside the workspace are denied, and a denial aborts your turn."
+    )
+
+
 def build_agy_cmd(job: dict, prompt: str) -> list[str]:
     cmd = [require_agy(), "--output-format", "stream-json"]
+    for extra in job.get("add_dirs") or []:
+        cmd += ["--add-dir", extra]
     if job.get("model"):
         cmd += ["--model", job["model"]]
     if job.get("effort"):
@@ -435,14 +469,15 @@ def run_job(job_id: str) -> None:
             template = REVIEW_PROMPT if job["kind"] == "review" else ADVERSARIAL_PROMPT
             focus = f"\nExtra focus requested by the user: {job['prompt']}\n" if job["prompt"] else ""
             prompt = template.format(
-                context_file=ctx_file, focus=focus, rules=f"{READ_ONLY_RULES}\n\n{EVIDENCE_RULES}"
+                context_file=ctx_file, focus=focus,
+                rules=f"{READ_ONLY_RULES}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}",
             )
         else:
             if job["read_only"]:
                 rules = READ_ONLY_RULES
             else:
                 rules = WRITE_RULES_WITH_SHELL if job.get("allow_shell") else WRITE_RULES
-            prompt = f"{job['prompt']}\n\n{rules}\n\n{EVIDENCE_RULES}"
+            prompt = f"{job['prompt']}\n\n{rules}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}"
 
         stdout_f = DATA_DIR / "logs" / f"{job_id}.stdout"
         stderr_f = DATA_DIR / "logs" / f"{job_id}.stderr"
@@ -467,7 +502,9 @@ def run_job(job_id: str) -> None:
         steps, prefixes = tool_trace(stdout), [str(wt) if wt else "", root]
         job["files_read"] = files_read(steps, prefixes)
         if job["response"].strip():
-            job["citation_check"] = check_citations(root, job["response"], opened_files(steps, prefixes))
+            job["citation_check"] = check_citations(
+                root, job["response"], opened_files(steps, prefixes), job.get("add_dirs")
+            )
         ok = result.get("status") == "SUCCESS" and proc.returncode == 0
         if ok and not job["response"].strip():
             ok = False
@@ -478,6 +515,8 @@ def run_job(job_id: str) -> None:
     except Exception as exc:  # noqa: BLE001 - runner must always record an outcome
         job.update(status="failed", error=f"{type(exc).__name__}: {exc}")
     finally:
+        if job.get("error"):
+            job["error"] = scrub_unsafe_advice(job["error"])
         if wt:
             remove_worktree(root, str(wt))
         if job["status"] not in TERMINAL:
@@ -516,11 +555,25 @@ def render_result(job: dict) -> str:
     if meta:
         lines.append(" ".join(meta))
     if job.get("denied_actions"):
+        actions = {a.get("action", "?") for a in job["denied_actions"]}
         names = ", ".join(sorted({a.get("display_name") or a.get("action", "?") for a in job["denied_actions"]}))
+        hints = []
+        if "command" in actions:
+            hints.append(
+                "for shell commands, allow specific ones in ~/.gemini/antigravity-cli/settings.json "
+                "under permissions.allow, e.g. \"command(uv run pytest)\", and pass --allow-shell"
+            )
+        if "read_file" in actions:
+            hints.append(
+                "for reads outside the repo, pass --add-dir <dir> (a symlink whose target is outside "
+                "the workspace is denied too: use a real copy or add the target's directory)"
+            )
+        if "write_file" in actions:
+            hints.append("agy tried to write outside the workspace (e.g. into an --add-dir), which headless mode denies")
         lines.append(
-            f"WARNING: agy was denied these tools in headless mode: {names}. "
-            "Its answer may be incomplete. Allow specific commands in "
-            "~/.gemini/antigravity-cli/settings.json under permissions.allow, e.g. \"command(uv run pytest)\"."
+            f"WARNING: agy was denied these tools in headless mode: {names}. A denial ends agy's turn, so its answer "
+            f"is likely incomplete. Do not retry with --dangerously-skip-permissions; report this to the user. "
+            + ("Fix: " + "; ".join(hints) + "." if hints else "")
         )
     if job.get("error"):
         lines.append(f"ERROR: {job['error']}")
@@ -595,6 +648,17 @@ def finish(job: dict, background: bool, wait: int) -> None:
 # commands
 
 
+def resolve_add_dirs(dirs: list[str] | None) -> list[str]:
+    out = []
+    for d in dirs or []:
+        path = os.path.realpath(os.path.expanduser(d))
+        if not os.path.isdir(path):
+            die(f"--add-dir {d}: not a directory")
+        if path not in out:
+            out.append(path)
+    return out
+
+
 def new_job(kind: str, args: argparse.Namespace, workspace: str, prompt: str, read_only: bool) -> dict:
     return {
         "id": uuid.uuid4().hex[:8],
@@ -606,6 +670,7 @@ def new_job(kind: str, args: argparse.Namespace, workspace: str, prompt: str, re
         "model": args.model or os.environ.get("AGY_COMPANION_MODEL") or None,
         "effort": args.effort,
         "base": getattr(args, "base", None),
+        "add_dirs": resolve_add_dirs(getattr(args, "add_dir", None)),
         "created_at": now(),
     }
 
@@ -731,6 +796,10 @@ def main() -> None:
         p.add_argument("--effort", choices=["low", "medium", "high", "max"])
         p.add_argument("--background", action="store_true", help="return immediately with a job id")
         p.add_argument("--wait", type=int, default=DEFAULT_WAIT_SECONDS, help="max seconds to wait in the foreground")
+        p.add_argument(
+            "--add-dir", action="append", metavar="DIR",
+            help="extra directory agy may read (repeatable); headless agy denies writes there",
+        )
 
     p = sub.add_parser("task")
     add_run_flags(p)

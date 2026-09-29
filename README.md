@@ -18,7 +18,7 @@ Every skill runs as a slash command. Claude can also call `status` and `result` 
 
 For delegation that Claude starts itself, the `agy-rescue` subagent hands a task to agy when you have told Claude to send that kind of work there.
 
-Shared flags: `--background` (return a job id immediately), `--model <id>` (see `agy models`), `--effort low|medium|high|max`, `--wait <seconds>` (foreground limit, default 540). Rescue-only flags: `--read-only`, `--resume` (continue the last agy task conversation in this repo), `--allow-shell`.
+Shared flags: `--background` (return a job id immediately), `--model <id>` (see `agy models`), `--effort low|medium|high|max`, `--wait <seconds>` (foreground limit, default 540), `--add-dir <dir>` (repeatable: another directory agy may read, such as a sibling repo). Rescue-only flags: `--read-only`, `--resume` (continue the last agy task conversation in this repo), `--allow-shell`.
 
 Set `AGY_COMPANION_MODEL` to change the default model.
 
@@ -54,6 +54,9 @@ These are properties of `agy -p` 1.2.x that the plugin was built around. All of 
   ```
   `--allow-shell` only changes the instructions agy receives. It never passes `--dangerously-skip-permissions`.
 - **File writes are not blocked in headless mode, not even with `--mode plan`.** Reviews and `--read-only` tasks therefore run in a detached git worktree under `~/.cache/agy-companion/worktrees`, with your uncommitted changes and untracked files copied in. The worktree is deleted when the job ends.
+- **Reading outside the repo is denied, and so is reading through a symlink that points outside it.** Pass `--add-dir <dir>` for each extra directory agy needs. A skill or file symlinked from elsewhere (for example into `~/.gemini/config/skills/`) is listed by agy but denied when read, so use a real copy there.
+- **Writing into an `--add-dir` directory was denied too** (observed on agy 1.2.12 with default permissions). The prompt also tells agy those directories are read-only. This is agy's behavior, not a sandbox the plugin enforces: if you allow-list `write_file` in agy's settings, agy could write there, even in a `--read-only` job.
+- **The plugin never bypasses agy's permissions.** agy's own denial message suggests re-running with `--dangerously-skip-permissions`; the plugin strips that advice, and its skills and subagent are told never to use it and to report denials instead.
 - **`status: "SUCCESS"` is not trustworthy on its own.** A job counts as failed when agy returns an empty response. Denied tools are surfaced as a `WARNING` line.
 - **Large context goes through a file.** A single argv entry is capped at 128 KiB on Linux and `agy -p` does not read the prompt from stdin, so the review diff is written to `.agy-context/CONTEXT.md` inside the worktree and agy reads it from there.
 

@@ -1,7 +1,7 @@
 ---
 name: review
 description: Read-only code review of your changes by Antigravity (agy)
-argument-hint: "[--base <ref>] [--background] [--model <id>] [--effort <level>] [focus]"
+argument-hint: "[--base <ref>] [--background] [--model <id>] [--effort <level>] [--add-dir <dir>]... [focus]"
 disable-model-invocation: true
 allowed-tools:
   - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py *)

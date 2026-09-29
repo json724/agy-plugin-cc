@@ -1,7 +1,7 @@
 ---
 name: adversarial-review
 description: Have Antigravity (agy) challenge the design, assumptions and tradeoffs of your changes
-argument-hint: "[--base <ref>] [--background] [--model <id>] [--effort <level>] [focus]"
+argument-hint: "[--base <ref>] [--background] [--model <id>] [--effort <level>] [--add-dir <dir>]... [focus]"
 disable-model-invocation: true
 allowed-tools:
   - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py *)
