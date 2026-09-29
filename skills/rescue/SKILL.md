@@ -1,7 +1,12 @@
 ---
+name: rescue
 description: Delegate a task (bug, investigation, implementation) to Antigravity (agy)
 argument-hint: "[--background] [--read-only] [--resume] [--allow-shell] [--model <id>] [--effort low|medium|high|max] <task>"
-allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py:*), Bash(git diff:*), Bash(git status:*)
+disable-model-invocation: true
+allowed-tools:
+  - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py *)
+  - Bash(git diff *)
+  - Bash(git status *)
 ---
 
 Delegate this task to the Antigravity CLI through the companion script.

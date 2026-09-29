@@ -2,19 +2,21 @@
 
 Delegate work from Claude Code to the [Antigravity CLI](https://antigravity.google) (`agy`) so it runs on your Antigravity quota instead of Claude tokens. Modeled on OpenAI's `codex-plugin-cc`.
 
-## Commands
+## Skills
 
-| Command | What it does |
-| --- | --- |
-| `/agy:rescue [flags] <task>` | Hands a bug, investigation or implementation to agy. Edits your repo unless `--read-only`. |
-| `/agy:review [--base <ref>] [focus]` | Read-only review of uncommitted changes, or of the branch against `<ref>`. |
-| `/agy:adversarial-review [--base <ref>] [focus]` | Read-only critique of design, assumptions and tradeoffs. |
-| `/agy:status [job]` | Lists jobs for this repo. |
-| `/agy:result [job]` | Prints the output of the latest (or given) finished job. |
-| `/agy:cancel [job]` | Stops the running (or given) job. |
-| `/agy:setup` | Checks that `agy` is installed and signed in, and lists models. |
+Every skill runs as a slash command. Claude can also call `status` and `result` on its own to follow a background job. The skills that spend agy quota or stop work set `disable-model-invocation: true`, so only you can start them.
 
-The `agy-rescue` subagent lets Claude delegate on its own when you tell it to send a kind of work to agy.
+| Skill | Who invokes it | What it does |
+| --- | --- | --- |
+| `/agy:rescue [flags] <task>` | You | Hands a bug, investigation or implementation to agy. Edits your repo unless `--read-only`. |
+| `/agy:review [--base <ref>] [focus]` | You | Read-only review of uncommitted changes, or of the branch against `<ref>`. |
+| `/agy:adversarial-review [--base <ref>] [focus]` | You | Read-only critique of design, assumptions and tradeoffs. |
+| `/agy:status [job]` | You or Claude | Lists jobs for this repo. |
+| `/agy:result [job]` | You or Claude | Prints the output of the latest (or given) finished job. |
+| `/agy:cancel [job]` | You | Stops the running (or given) job. |
+| `/agy:setup` | You | Checks that `agy` is installed and signed in, and lists models. |
+
+For delegation that Claude starts itself, the `agy-rescue` subagent hands a task to agy when you have told Claude to send that kind of work there.
 
 Shared flags: `--background` (return a job id immediately), `--model <id>` (see `agy models`), `--effort low|medium|high|max`, `--wait <seconds>` (foreground limit, default 540). Rescue-only flags: `--read-only`, `--resume` (continue the last agy task conversation in this repo), `--allow-shell`.
 
