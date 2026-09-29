@@ -307,13 +307,22 @@ def parse_agy_output(stdout: str) -> dict | None:
 
 
 def tool_trace(stdout: str) -> list[dict]:
-    """Completed tool steps from a stream-json run: name and parameters."""
+    """Finished tool steps from a stream-json run: name, parameters, and any error.
+
+    A step agy was not allowed to run ends in state ERROR ("permission check
+    failed"); it is kept so the trace shows what was denied.
+    """
     steps = []
     for obj in iter_json_objects(stdout):
         step = obj.get("step_update") or {}
-        if step.get("step_type") == "tool" and step.get("state") == "DONE":
+        if step.get("step_type") == "tool" and step.get("state") in ("DONE", "ERROR"):
             info = step.get("tool_info") or {}
-            steps.append({"tool": info.get("name") or step.get("tool_name"), "params": info.get("parameters") or {}})
+            error = (info.get("error") or {}).get("message") if step.get("state") == "ERROR" else None
+            steps.append({
+                "tool": info.get("name") or step.get("tool_name"),
+                "params": info.get("parameters") or {},
+                "error": error or ("failed" if step.get("state") == "ERROR" else None),
+            })
     return steps
 
 
@@ -328,7 +337,7 @@ def opened_files(steps: list[dict], prefixes: list[str]) -> list[str]:
     """Repo-relative paths of files agy opened with a file-viewing tool."""
     out = []
     for step in steps:
-        if "view" not in (step["tool"] or ""):
+        if "view" not in (step["tool"] or "") or step.get("error"):
             continue
         path = next((v for k, v in step["params"].items() if "path" in k.lower() and isinstance(v, str)), "")
         if path and CONTEXT_DIRNAME not in path:
@@ -338,9 +347,15 @@ def opened_files(steps: list[dict], prefixes: list[str]) -> list[str]:
     return out
 
 
-def files_read(steps: list[dict], prefixes: list[str]) -> list[str]:
-    """Human-readable list of what agy opened or searched, relative to the repo."""
+def files_read(steps: list[dict], prefixes: list[str], outside: str | None = None) -> list[str]:
+    """Human-readable list of what agy opened or searched, relative to the repo.
+
+    `outside` is the user's real repo in a read-only job: agy should only touch
+    the snapshot, so paths under the real repo are shown in full and flagged.
+    """
     def rel(path: str) -> str:
+        if outside and path.startswith(outside.rstrip("/") + "/"):
+            return f"{path} [original repo, outside the read-only snapshot]"
         return rel_to(path, prefixes)
 
     out: list[str] = []
@@ -357,6 +372,8 @@ def files_read(steps: list[dict], prefixes: list[str]) -> list[str]:
             entry += f" (lines {'-'.join(lines)})"
         if query:
             entry += f" for {query!r}"
+        if step.get("error"):
+            entry = f"DENIED/FAILED {entry} ({step['error'][:80]})"
         if entry not in out:
             out.append(entry)
     return out
@@ -420,6 +437,25 @@ def scrub_unsafe_advice(text: str) -> str:
     return UNSAFE_ADVICE_RE.sub("", text)
 
 
+def point_at_snapshot(text: str, root: str, wt: Path) -> str:
+    """Rewrite mentions of the real repo path to the read-only snapshot path.
+
+    In a read-only job agy's workspace is the snapshot; the real repo is outside
+    it, and reading there is denied (unless it sits somewhere agy may read
+    anyway, such as /tmp). Word-boundary match so /repo does not hit /repo-2.
+    """
+    return re.sub(re.escape(root.rstrip("/")) + r"(?![\w-])(?!\.\w)", str(wt), text)
+
+
+def snapshot_note(root: str, wt: Path) -> str:
+    return (
+        f"\n\nWorkspace: the repository {root} is available to you as a read-only snapshot at {wt}, "
+        "with the user's uncommitted changes included. Read it through paths under that snapshot "
+        f"(or paths relative to it). Do not use paths under {root}: that location is outside your workspace "
+        "and reading it is denied."
+    )
+
+
 def add_dirs_note(job: dict) -> str:
     dirs = job.get("add_dirs") or []
     if not dirs:
@@ -467,17 +503,20 @@ def run_job(job_id: str) -> None:
                 return
             ctx_file = write_context(wt, ctx_text)
             template = REVIEW_PROMPT if job["kind"] == "review" else ADVERSARIAL_PROMPT
-            focus = f"\nExtra focus requested by the user: {job['prompt']}\n" if job["prompt"] else ""
+            user_focus = point_at_snapshot(job["prompt"], root, wt) if job["prompt"] else ""
+            focus = f"\nExtra focus requested by the user: {user_focus}\n" if user_focus else ""
             prompt = template.format(
                 context_file=ctx_file, focus=focus,
-                rules=f"{READ_ONLY_RULES}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}",
+                rules=f"{READ_ONLY_RULES}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}{snapshot_note(root, wt)}",
             )
         else:
             if job["read_only"]:
                 rules = READ_ONLY_RULES
             else:
                 rules = WRITE_RULES_WITH_SHELL if job.get("allow_shell") else WRITE_RULES
-            prompt = f"{job['prompt']}\n\n{rules}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}"
+            user_prompt = point_at_snapshot(job["prompt"], root, wt) if wt else job["prompt"]
+            sandbox = snapshot_note(root, wt) if wt else ""
+            prompt = f"{user_prompt}\n\n{rules}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}{sandbox}"
 
         stdout_f = DATA_DIR / "logs" / f"{job_id}.stdout"
         stderr_f = DATA_DIR / "logs" / f"{job_id}.stderr"
@@ -500,7 +539,7 @@ def run_job(job_id: str) -> None:
         job["agy_duration_seconds"] = result.get("duration_seconds")
         job["denied_actions"] = result.get("denied_actions") or []
         steps, prefixes = tool_trace(stdout), [str(wt) if wt else "", root]
-        job["files_read"] = files_read(steps, prefixes)
+        job["files_read"] = files_read(steps, [str(wt)] if wt else [root], outside=root if wt else None)
         if job["response"].strip():
             job["citation_check"] = check_citations(
                 root, job["response"], opened_files(steps, prefixes), job.get("add_dirs")
@@ -563,7 +602,12 @@ def render_result(job: dict) -> str:
                 "for shell commands, allow specific ones in ~/.gemini/antigravity-cli/settings.json "
                 "under permissions.allow, e.g. \"command(uv run pytest)\", and pass --allow-shell"
             )
-        if "read_file" in actions:
+        if "read_file" in actions and any("[original repo" in e for e in job.get("files_read") or []):
+            hints.append(
+                "agy tried to read the real repo instead of its read-only snapshot; this is a plugin issue, "
+                "report it (do not add the repo as --add-dir)"
+            )
+        elif "read_file" in actions:
             hints.append(
                 "for reads outside the repo, pass --add-dir <dir> (a symlink whose target is outside "
                 "the workspace is denied too: use a real copy or add the target's directory)"
