@@ -21,4 +21,5 @@ User input: $ARGUMENTS
 5. Never call `agy` directly and never add `--dangerously-skip-permissions`. If agy was denied a tool, show the warning and its suggested fix to the user and let them decide; do not work around it.
 6. If the task changes code and the repo is under $HOME (the normal case), add `--as-diff`: headless agy cannot write there, so it returns a patch that the companion applies. Report which files were applied and which were not; never hand-apply a failed hunk without showing it to the user first.
 7. If the task needs files outside this repo, pass `--add-dir <dir>` for each such directory (agy can read there; headless agy denies writes there).
+   If the task needs searching the code, listing files or running tests, pass `--allow-shell` (in any mode). Headless agy has no search tool, so without it agy only opens files by path. It runs only the commands the user allow-listed in agy's settings.
 8. If the job is still running when the wait ends, tell the user the job id and that /agy:result will fetch it.

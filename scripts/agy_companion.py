@@ -59,23 +59,41 @@ CONTEXT_DIRNAME = ".agy-context"
 DEFAULT_WAIT_SECONDS = 540  # stays under Claude Code's 10-minute Bash cap
 TERMINAL = {"completed", "failed", "cancelled"}
 
+# agy 1.3.x headless declares view_file but no grep_search, list_dir or
+# find_by_name: naming tools it lacks made it guess file paths blindly.
+NO_SHELL_TOOLS = (
+    "- Do NOT use run_command or any terminal tool. In this headless session shell commands are denied, and a single denial aborts your whole turn.\n"
+    "- Read code with view_file. Use grep_search, list_dir or find_by_name only if they are in your tool list (headless agy 1.3.x has none of them). "
+    "Without them, open the files the request names, then the files those import or reference; do not guess file names."
+)
+
+SHELL_TOOLS = (
+    "- {commands} A denied command aborts your whole turn.\n"
+    "- Use the allowed commands to search and list files instead of guessing file names "
+    "(for example `git grep -n <pattern>` and `git ls-files`, if allowed: they work in any git checkout, while `rg` may not be installed), "
+    "and to run the tests or linters they cover. "
+    "Read files with view_file."
+)
+
 READ_ONLY_RULES = """\
 Operating rules for this session:
 - You are running inside a disposable copy of the repository. Treat it as READ-ONLY: do not create, edit or delete files.
-- Do NOT use run_command or any terminal tool. In this headless session shell commands are denied, and a single denial aborts your whole turn. Read code with view_file, grep_search, list_dir and find_by_name.
+{tools}
 - Report back in plain Markdown. Cite code as path:line."""
 
 WRITE_RULES = """\
 Operating rules for this session:
 - You are working directly in the user's repository. Edit files as needed to complete the task.
-- Do NOT use run_command or any terminal tool. In this headless session shell commands are denied, and a single denial aborts your whole turn. Read with view_file, grep_search, list_dir, find_by_name; edit with replace_file_content, multi_replace_file_content, write_to_file.
+{tools}
+- Edit with replace_file_content, multi_replace_file_content, write_to_file.
 - You cannot run tests. Instead, list the exact commands the user should run to verify your change.
 - Finish with a short report: what you changed (path:line), how you checked it, and what remains unverified."""
 
 WRITE_RULES_WITH_SHELL = """\
 Operating rules for this session:
 - You are working directly in the user's repository. Edit files as needed to complete the task.
-- Only the shell commands the user allow-listed will run; any other command is denied and a denial aborts your whole turn. Prefer your file tools (view_file, grep_search, replace_file_content, write_to_file) and use run_command only for build/test commands you were told are allowed.
+{tools}
+- Edit with replace_file_content, multi_replace_file_content, write_to_file.
 - Finish with a short report: what you changed (path:line), what you verified and how, and what remains unverified."""
 
 DIFF_RULES = """\
@@ -562,6 +580,49 @@ def snapshot_note(root: str, wt: Path) -> str:
     )
 
 
+AGY_SETTINGS = Path(
+    os.environ.get("AGY_SETTINGS")
+    or Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+)
+
+
+def command_rules() -> tuple[list[str], list[str]]:
+    """(allowed, denied) command targets from agy's settings.json.
+
+    Read only, to tell agy which commands will run: agy enforces the rules
+    itself (deny wins), and the plugin never edits them.
+    """
+    try:
+        perms = json.loads(AGY_SETTINGS.read_text()).get("permissions") or {}
+    except (OSError, ValueError, AttributeError):
+        return [], []
+
+    def targets(kind: str) -> list[str]:
+        rules = perms.get(kind) or []
+        return [r[len("command("):-1] for r in rules if isinstance(r, str) and r.startswith("command(") and r.endswith(")")]
+
+    denied = targets("deny")
+    return [c for c in targets("allow") if c not in denied], denied
+
+
+def tool_rules(allow_shell: bool) -> str:
+    allowed, denied = command_rules() if allow_shell else ([], [])
+    if not allowed:
+        return NO_SHELL_TOOLS
+    if "*" in allowed:
+        commands = "run_command may run any command (`*` is allow-listed)."
+    else:
+        commands = (
+            "run_command works ONLY for commands starting with one of these allow-listed prefixes: "
+            + ", ".join(f"`{c}`" for c in allowed)
+            + ". Any other command, or one using $(...), backticks or redirections, is denied."
+        )
+    rules = SHELL_TOOLS.format(commands=commands)
+    if denied:
+        rules += "\n- Always denied, even under an allowed prefix: " + ", ".join(f"`{c}`" for c in denied) + "."
+    return rules
+
+
 def add_dirs_note(job: dict) -> str:
     dirs = job.get("add_dirs") or []
     if not dirs:
@@ -570,7 +631,7 @@ def add_dirs_note(job: dict) -> str:
     return (
         "\n\nExtra directories you may READ (reference only):\n"
         f"{listed}\n"
-        "Read them with view_file/grep_search using absolute paths and cite them as absolute path:line. "
+        "Read them with view_file using absolute paths and cite them as absolute path:line. "
         "Never create, edit or delete files there: writes outside the workspace are denied, and a denial aborts your turn."
     )
 
@@ -613,13 +674,18 @@ def run_job(job_id: str) -> None:
             focus = f"\nExtra focus requested by the user: {user_focus}\n" if user_focus else ""
             prompt = template.format(
                 context_file=ctx_file, focus=focus,
-                rules=f"{READ_ONLY_RULES}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}{snapshot_note(root, wt)}",
+                rules=f"{READ_ONLY_RULES.format(tools=NO_SHELL_TOOLS)}\n\n{EVIDENCE_RULES}{add_dirs_note(job)}{snapshot_note(root, wt)}",
             )
         else:
+            # --allow-shell counts in read-only and --as-diff jobs too: their
+            # throwaway worktree is the safest place to run commands.
+            tools = tool_rules(bool(job.get("allow_shell")))
             if job["read_only"]:
-                rules = READ_ONLY_RULES
+                rules = READ_ONLY_RULES.format(tools=tools)
+            elif tools is NO_SHELL_TOOLS:
+                rules = WRITE_RULES.format(tools=tools)
             else:
-                rules = WRITE_RULES_WITH_SHELL if job.get("allow_shell") else WRITE_RULES
+                rules = WRITE_RULES_WITH_SHELL.format(tools=tools)
             user_prompt = point_at_snapshot(job["prompt"], root, wt) if wt else job["prompt"]
             sandbox = snapshot_note(root, wt) if wt else ""
             diff_rules = f"\n\n{DIFF_RULES}" if job.get("as_diff") else ""
@@ -871,6 +937,12 @@ def cmd_task(args: argparse.Namespace) -> None:
     workspace = root or cwd
     job = new_job("task", args, workspace, prompt, args.read_only)
     job["allow_shell"] = args.allow_shell
+    if args.allow_shell and not command_rules()[0]:
+        print(
+            f"WARNING: --allow-shell has no effect: {AGY_SETTINGS} allow-lists no command(...) rules, "
+            "so agy is told not to use the shell.",
+            file=sys.stderr,
+        )
     job["as_diff"] = args.as_diff
     if args.resume:
         prev = next(
